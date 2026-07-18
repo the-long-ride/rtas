@@ -1,0 +1,58 @@
+{
+  "name": "@the-long-ride/rust-tauri-agent-skills",
+  "version": "0.0.1",
+  "description": "Compact agent skills for Rust, Tauri 2, TypeScript, Vite, and related app engineering workflows.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./cli": "./dist/cli.js",
+    "./commands/*": "./commands/*"
+  },
+  "bin": {
+    "rtas": "./dist/cli.js",
+    "rust-tauri-agent-skills": "./dist/cli.js",
+    "rust-tauri": "./dist/cli.js",
+    "rtas-skills": "./dist/cli.js"
+  },
+  "files": [
+    "commands/",
+    "dist/",
+    "skills/",
+    "AGENTS.example.md",
+    "LICENSE",
+    "MANIFEST.csv",
+    "README.md",
+    "ROUTING.md",
+    "SOURCES.md",
+    "install.ps1",
+    "install.sh"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "prepack": "npm run build && npm run test",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "validate": "npm run build && node dist/cli.js validate"
+  },
+  "keywords": [
+    "agent",
+    "skills",
+    "rust",
+    "tauri",
+    "typescript",
+    "vite"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^7.0.2"
+  }
+}
