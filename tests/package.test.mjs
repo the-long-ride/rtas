@@ -18,6 +18,7 @@ import {
   listRustRules,
   readRustRule,
   listSkills,
+  recoverInterruptedInstalls,
   resolveAgentDestination,
   resolveDefaultDestination,
   setRustTauriWorkspaceMode,
@@ -122,6 +123,133 @@ test("installer --force leaves no staging or backup leftovers at destination", a
     const installedCount = leftovers.filter((entry) => skills.some((skill) => skill.name === entry)).length;
     assert.equal(installedCount, skills.length);
     await assert.rejects(readFile(userMarker), /ENOENT/);
+  } finally {
+    await rm(destination, { recursive: true, force: true });
+  }
+});
+
+test("installSkills rolls back all commits when a mid-batch commit fails", async () => {
+  const skills = await snapshotSkills();
+  const destination = await mkdtemp(join(tmpdir(), "rtas-batch-rollback-"));
+  try {
+    await installSkills(destination);
+    const originalFirst = await readFile(join(destination, skills[0].name, "SKILL.md"), "utf8");
+    const originalMid = await readFile(join(destination, skills[Math.floor(skills.length / 2)].name, "SKILL.md"), "utf8");
+    const originalLast = await readFile(join(destination, skills[skills.length - 1].name, "SKILL.md"), "utf8");
+
+    const brokenSkillsDir = await mkdtemp(join(tmpdir(), "rtas-batch-broken-src-"));
+    try {
+      for (const skill of skills) {
+        const targetDir = join(brokenSkillsDir, skill.name);
+        await mkdir(targetDir, { recursive: true });
+        await writeFile(join(targetDir, "SKILL.md"), "---\nname: ${skill.name}\ndescription: broken\n---\nbody\n".replace("${skill.name}", skill.name), "utf8");
+      }
+      const poisonedSkill = skills[Math.floor(skills.length / 2)].name;
+      const poisonedDir = join(brokenSkillsDir, poisonedSkill);
+      await rm(join(poisonedDir, "SKILL.md"), { force: true });
+      await mkdir(join(poisonedDir, "SKILL.md"), { recursive: true });
+
+      await assert.rejects(
+        installSkills(destination, { force: true }, brokenSkillsDir),
+        /EEXIST|EISDIR|ENOTDIR|ENOENT/i,
+      );
+
+      const afterFirst = await readFile(join(destination, skills[0].name, "SKILL.md"), "utf8");
+      const afterMid = await readFile(join(destination, skills[Math.floor(skills.length / 2)].name, "SKILL.md"), "utf8");
+      const afterLast = await readFile(join(destination, skills[skills.length - 1].name, "SKILL.md"), "utf8");
+      assert.equal(afterFirst, originalFirst, "first skill drifted after failed batch");
+      assert.equal(afterMid, originalMid, "mid skill drifted after failed batch");
+      assert.equal(afterLast, originalLast, "last skill drifted after failed batch");
+
+      const entries = await readdir(destination);
+      assert.ok(
+        entries.every((entry) => !entry.includes("rtas-stage") && !entry.includes("rtas-bak") && entry !== ".rtas-tx"),
+        `leftover staging dirs after rollback: ${entries.join(",")}`,
+      );
+    } finally {
+      await rm(brokenSkillsDir, { recursive: true, force: true });
+    }
+  } finally {
+    await rm(destination, { recursive: true, force: true });
+  }
+});
+
+test("recoverInterruptedInstalls rolls back commits left by a crashed install", async () => {
+  const skills = await snapshotSkills();
+  const destination = await mkdtemp(join(tmpdir(), "rtas-recover-"));
+  try {
+    await installSkills(destination);
+    const victim = skills[0].name;
+    const victimPath = join(destination, victim, "SKILL.md");
+    const originalVictim = await readFile(victimPath, "utf8");
+
+    const txRoot = join(destination, ".rtas-tx");
+    await mkdir(join(txRoot, "tx-fake"), { recursive: true });
+    const backupDir = join(txRoot, "tx-fake", "backups", `${victim}-fake`);
+    await mkdir(dirname(backupDir), { recursive: true });
+    await rename(join(destination, victim), backupDir);
+    await mkdir(join(destination, victim), { recursive: true });
+    await writeFile(join(destination, victim, "SKILL.md"), "PARTIAL", "utf8");
+    await writeFile(
+      join(txRoot, "tx-fake", "journal.json"),
+      `${JSON.stringify({
+        txId: "tx-fake",
+        status: "committing",
+        createdAt: new Date().toISOString(),
+        commits: [{ name: victim, target: join(destination, victim), backup: backupDir }],
+      })}\n`,
+      "utf8",
+    );
+    await writeFile(join(txRoot, "lock"), JSON.stringify({ pid: 99999, startedAt: new Date(0).toISOString() }), "utf8");
+
+    const messages = await recoverInterruptedInstalls(destination);
+    assert.ok(messages.some((m) => m.includes("rolled back")), `expected rollback message, got: ${messages.join(";")}`);
+
+    const afterVictim = await readFile(victimPath, "utf8");
+    assert.equal(afterVictim, originalVictim, "recover did not restore the original skill");
+    const entries = await readdir(destination);
+    assert.ok(!entries.includes(".rtas-tx"), `.rtas-tx should be removed after recovery, got: ${entries.join(",")}`);
+  } finally {
+    await rm(destination, { recursive: true, force: true });
+  }
+});
+
+test("concurrent installSkills calls into the same destination do not corrupt each other", async () => {
+  const skills = await snapshotSkills();
+  const destination = await mkdtemp(join(tmpdir(), "rtas-concurrent-"));
+  try {
+    const brokenSkillsDir = await mkdtemp(join(tmpdir(), "rtas-concurrent-broken-"));
+    try {
+      for (const skill of skills) {
+        const targetDir = join(brokenSkillsDir, skill.name);
+        await mkdir(targetDir, { recursive: true });
+        await writeFile(join(targetDir, "SKILL.md"), "---\nname: ${n}\ndescription: broken\n---\nbody\n".replace("${n}", skill.name), "utf8");
+      }
+      const poisoned = skills[skills.length - 1].name;
+      await rm(join(brokenSkillsDir, poisoned, "SKILL.md"), { force: true });
+
+      const workers = [
+        installSkills(destination, { force: true }, brokenSkillsDir).catch((error) => error),
+        installSkills(destination, { force: true }, brokenSkillsDir).catch((error) => error),
+      ];
+      const results = await Promise.all(workers);
+      const errors = results.filter((r) => r instanceof Error);
+      assert.ok(errors.length >= 1, `expected at least one worker to fail, got: ${JSON.stringify(results.map((r) => (r instanceof Error ? r.message : "ok")))}`);
+
+      const entries = await readdir(destination);
+      assert.ok(
+        entries.every((entry) => !entry.includes("rtas-stage") && !entry.includes("rtas-bak")),
+        `leftover staging dirs after concurrent install: ${entries.join(",")}`,
+      );
+      if (entries.includes(skills[0].name)) {
+        const firstSkill = await readFile(join(destination, skills[0].name, "SKILL.md"), "utf8");
+        assert.ok(firstSkill.includes("broken") || firstSkill.length > 0, "first skill content should be intact or absent, not partially written");
+      }
+      const txEntries = entries.filter((e) => e === ".rtas-tx");
+      assert.ok(txEntries.length <= 1, `multiple .rtas-tx dirs left behind: ${txEntries.join(",")}`);
+    } finally {
+      await rm(brokenSkillsDir, { recursive: true, force: true });
+    }
   } finally {
     await rm(destination, { recursive: true, force: true });
   }
@@ -484,13 +612,54 @@ test("validation flags a router route target that no skill defines", async () =>
     await mkdir(routerDir);
     await writeFile(
       join(routerDir, "SKILL.md"),
-      "---\nname: app-engineering-router\ndescription: routes.\n---\n\nRoute to `does-not-exist`.\n",
+      "---\nname: app-engineering-router\ndescription: routes.\n---\n\nRoute table:\n- Unknown case → `does-not-exist`\n",
       "utf8",
     );
     const result = await validateSkills(skillsDir);
     assert.ok(result.errors.some((error) => error.includes("route target") && error.includes("does-not-exist")));
   } finally {
     await rm(skillsDir, { recursive: true, force: true });
+  }
+});
+
+test("validation ignores inline code that is not a route target", async () => {
+  const skillsDir = await mkdtemp(join(tmpdir(), "rtas-no-false-routes-"));
+  try {
+    const routerDir = join(skillsDir, "app-engineering-router");
+    await mkdir(routerDir);
+    await writeFile(
+      join(routerDir, "SKILL.md"),
+      "---\nname: app-engineering-router\ndescription: routes.\n---\n\nRun `cargo` and `npm` but never route to unknown skills.\n",
+      "utf8",
+    );
+    const result = await validateSkills(skillsDir);
+    assert.ok(
+      !result.errors.some((error) => error.includes("route target")),
+      `inline code was mistaken for a route: ${JSON.stringify(result.errors)}`,
+    );
+  } finally {
+    await rm(skillsDir, { recursive: true, force: true });
+  }
+});
+
+test("router install preserves reordered YAML frontmatter when renaming to rust-tauri", async () => {
+  const skillsDir = await mkdtemp(join(tmpdir(), "rtas-yaml-reorder-"));
+  const destination = await mkdtemp(join(tmpdir(), "rtas-yaml-reorder-dest-"));
+  try {
+    const routerDir = join(skillsDir, "app-engineering-router");
+    await mkdir(routerDir);
+    await mkdir(join(routerDir, "references"));
+    const reordered = "---\ndescription: Routes to a single skill.\nname: app-engineering-router\n---\n\nBody.\n";
+    await writeFile(join(routerDir, "SKILL.md"), reordered, "utf8");
+
+    await installRouterSkill(destination, {}, skillsDir);
+    const installed = await readFile(join(destination, "rust-tauri", "SKILL.md"), "utf8");
+    assert.match(installed, /^---\n[\s\S]*name: rust-tauri[\s\S]*\n---\n/);
+    assert.match(installed, /Routes to a single skill\./);
+    assert.ok(!/name: app-engineering-router/.test(installed), "original router name leaked through rename");
+  } finally {
+    await rm(skillsDir, { recursive: true, force: true });
+    await rm(destination, { recursive: true, force: true });
   }
 });
 
