@@ -25,6 +25,10 @@ export interface WorkspaceToggleResult {
     statePath: string;
     workspace: string;
 }
+export interface ValidateOptions {
+    skillsDir?: string;
+    routingFile?: string;
+}
 export declare const AGENT_DIRS: Record<string, {
     local: string;
     global: string;
@@ -43,7 +47,8 @@ export declare function listSkills(skillsDir?: string): Promise<SkillSummary[]>;
 export declare function readSkillSummary(folder: string, filePath: string): Promise<SkillSummary>;
 export declare function installSkills(destination: string, options?: InstallOptions, skillsDir?: string): Promise<InstallResult>;
 export declare function installRouterSkill(destination: string, options?: InstallOptions, skillsDir?: string): Promise<InstallResult>;
-export declare function validateSkills(skillsDir?: string): Promise<ValidationResult>;
+export declare function validateSkills(input?: string | ValidateOptions): Promise<ValidationResult>;
 export declare function setRustTauriWorkspaceMode(workspace: string | undefined, enabled: boolean): Promise<WorkspaceToggleResult>;
 export declare function getRustTauriWorkspaceMode(workspace?: string): Promise<WorkspaceToggleResult>;
+export declare function recoverInterruptedInstalls(parentDir: string): Promise<string[]>;
 //# sourceMappingURL=index.d.ts.map
