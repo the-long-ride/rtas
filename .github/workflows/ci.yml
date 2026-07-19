@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build & test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node-version: [20, 22]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - run: npm run validate
+      - name: Verify committed dist matches src
+        shell: bash
+        run: |
+          if [ -n "$(git status --porcelain dist)" ]; then
+            echo "::error::committed dist/ output is stale. Run 'npm run build' and commit the result."
+            git --no-pager diff -- dist
+            exit 1
+          fi
+      - name: Verify npm package contents
+        shell: bash
+        run: |
+          npm pack --dry-run
+          tarball=$(npm pack 2>/dev/null | tail -n 1)
+          tar -tzf "$tarball" | sort > published-files.txt
+          cat published-files.txt
+          required=(
+            "./package.json"
+            "./README.md"
+            "./ROUTING.md"
+            "./MANIFEST.csv"
+            "./LICENSE"
+            "./install.sh"
+            "./install.ps1"
+            "./AGENTS.example.md"
+            "./dist/index.js"
+            "./dist/cli.js"
+            "./commands/rust-tauri.md"
+          )
+          missing=0
+          for path in "${required[@]}"; do
+            if ! grep -q "^$path\$" published-files.txt; then
+              echo "::error::required file missing from package: $path"
+              missing=1
+            fi
+          done
+          rm -f published-files.txt "$tarball"
+          exit $missing
+
+  installer-shells:
+    name: Installer wrapper smoke
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: windows-latest
+            shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Run install.sh into a temp directory
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          dest="$(mktemp -d)/skills"
+          ./install.sh "$dest"
+          test -f "$dest/app-engineering-router/SKILL.md"
+          test -f "$dest/rust-core/SKILL.md"
+      - name: Run install.ps1 into a temp directory
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $dest = Join-Path $env:RUNNER_TEMP "skills"
+          ./install.ps1 -Destination $dest
+          if (-not (Test-Path "$dest/app-engineering-router/SKILL.md")) {
+            Write-Error "missing app-engineering-router/SKILL.md after install.ps1"; exit 1
+          }
+          if (-not (Test-Path "$dest/rust-core/SKILL.md")) {
+            Write-Error "missing rust-core/SKILL.md after install.ps1"; exit 1
+          }
