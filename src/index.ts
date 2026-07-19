@@ -62,6 +62,7 @@ const txDirName = ".rtas-tx";
 const lockName = "lock";
 const journalName = "journal.json";
 const lockStaleMs = 5 * 60 * 1000;
+const heartbeatIntervalMs = 15 * 1000;
 const skillNamePattern = /^[a-z0-9-]+$/;
 const arrowRoutePattern = /→\s*`([a-z0-9-]+)`/g;
 const tableRoutePattern = /\|\s*`([a-z0-9-]+)`\s*(?:\||$)/g;
@@ -259,10 +260,13 @@ export async function installRouterSkill(
   await withInstallTx(destination, async (txDir, journal) => {
     await stageRouter(txDir, stageDirName, routerSource, installedRouterText);
     journal.set({ status: "committing" });
-    const backup = await commitStaged(txDir, stageDirName, target, exists, journal);
-    if (backup) {
-      journal.recordBackup(stageDirName, target, backup);
-    }
+    const committer = new TxCommitter(txDir, journal);
+    await committer.commit({
+      name: stageDirName,
+      source: join(txDir, "stage", stageDirName),
+      target,
+      force: exists,
+    });
     journal.set({ status: "done" });
   });
 
@@ -400,11 +404,23 @@ export async function getRustTauriWorkspaceMode(workspace = process.cwd()): Prom
   return { agentsPath, enabled, statePath, workspace: target };
 }
 
+type CommitState = "prepared" | "backup-created" | "replaced" | "complete" | "restored";
+
+interface TxCommit {
+  name: string;
+  target: string;
+  backup?: string;
+  state: CommitState;
+}
+
 interface TxJournal {
   txId: string;
   status: string;
   createdAt: string;
-  commits: Array<{ name: string; target: string; backup: string }>;
+  heartbeatAt: string;
+  pid: number;
+  commits: TxCommit[];
+  errors: string[];
 }
 
 interface TxJournalAppender {
@@ -506,111 +522,159 @@ async function commitAll(
   plans: StagePlan[],
   journal: TxJournalWriter,
 ): Promise<void> {
-  const committed: Array<{ name: string; target: string; backup: string }> = [];
+  const committer = new TxCommitter(txDir, journal);
   try {
     for (const plan of plans) {
-      const backup = await commitStagedByName(txDir, plan.name, plan.target, plan.force, journal);
-      committed.push({ name: plan.name, target: plan.target, backup: backup ?? "" });
-      journal.recordBackup(plan.name, plan.target, backup);
+      await committer.commit(plan);
     }
   } catch (error) {
-    journal.set({ status: "rolling-back" });
-    await rollbackCommits(committed, journal);
-    journal.set({ status: "failed" });
+    await committer.rollbackAll();
     throw error;
   }
 }
 
-async function commitStagedByName(
-  txDir: string,
-  stageName: string,
-  target: string,
-  targetExists: boolean,
-  _journal: TxJournalWriter,
-): Promise<string | undefined> {
-  const staged = join(txDir, "stage", stageName);
-  const backup = targetExists ? await moveExistingToBackup(txDir, stageName, target) : undefined;
-  await rename(staged, target);
-  return backup;
-}
+class TxCommitter {
+  private readonly txDir: string;
+  private readonly journal: TxJournalRecorder;
+  private readonly commits: TxCommit[] = [];
 
-async function commitStaged(
-  txDir: string,
-  stageName: string,
-  target: string,
-  targetExists: boolean,
-  _journal: TxJournalWriter,
-): Promise<string | undefined> {
-  return commitStagedByName(txDir, stageName, target, targetExists, _journal);
-}
+  constructor(txDir: string, journal: TxJournalRecorder) {
+    this.txDir = txDir;
+    this.journal = journal;
+  }
 
-async function moveExistingToBackup(txDir: string, stageName: string, target: string): Promise<string> {
-  const backupDir = join(txDir, "backups", `${stageName}-${newTxId()}`);
-  await mkdir(dirname(backupDir), { recursive: true });
-  await rename(target, backupDir);
-  return backupDir;
-}
+  async commit(plan: StagePlan): Promise<void> {
+    const staged = join(this.txDir, "stage", plan.name);
+    const stagedExists = await pathExists(staged);
+    if (!stagedExists) {
+      throw new Error(`staged skill missing: ${staged}`);
+    }
+    const targetExists = await pathExists(plan.target);
+    if (targetExists && !plan.force) {
+      throw new Error(`Destination already exists: ${plan.target}`);
+    }
+    const commit: TxCommit = { name: plan.name, target: plan.target, state: "prepared" };
+    this.commits.push(commit);
+    await this.journal.recordCommit(commit);
 
-async function rollbackCommits(
-  committed: Array<{ name: string; target: string; backup: string }>,
-  journal: TxJournalAppender,
-): Promise<void> {
-  for (const entry of [...committed].reverse()) {
-    try {
-      if (entry.backup && (await pathExists(entry.backup))) {
-        if (await pathExists(entry.target)) {
-          await rm(entry.target, { recursive: true, force: true });
-        }
-        await rename(entry.backup, entry.target);
-      } else if (await pathExists(entry.target)) {
-        await rm(entry.target, { recursive: true, force: true });
+    if (targetExists) {
+      const backup = join(this.txDir, "backups", `${plan.name}-${newTxId()}`);
+      await mkdir(dirname(backup), { recursive: true });
+      commit.state = "backup-created";
+      commit.backup = backup;
+      await this.journal.recordCommit(commit);
+      await rename(plan.target, backup);
+    }
+
+    commit.state = "replaced";
+    await this.journal.recordCommit(commit);
+    await rename(staged, plan.target);
+
+    commit.state = "complete";
+    await this.journal.recordCommit(commit);
+  }
+
+  async rollbackAll(): Promise<void> {
+    for (const commit of [...this.commits].reverse()) {
+      try {
+        await this.rollbackOne(commit);
+      } catch (error) {
+        this.journal.appendError(
+          `rollback failed for ${commit.name}: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
-    } catch (error) {
-      journal.appendError(`rollback failed for ${entry.name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private async rollbackOne(commit: TxCommit): Promise<void> {
+    if (commit.state === "restored" || commit.state === "prepared") {
+      return;
+    }
+    const backup = commit.backup;
+    const backupExists = backup ? await pathExists(backup) : false;
+    if (!backupExists) {
+      // No backup to restore from; never delete the current target. Idempotency
+      // guard: a previous rollback may have already restored it.
+      commit.state = "restored";
+      await this.journal.recordCommit(commit);
+      return;
+    }
+    if (backup && backupExists) {
+      const targetExists = await pathExists(commit.target);
+      if (targetExists) {
+        await rm(commit.target, { recursive: true, force: true });
+      }
+      await rename(backup, commit.target);
+      commit.state = "restored";
+      await this.journal.recordCommit(commit);
     }
   }
 }
 
-class TxJournalWriter {
+class TxJournalWriter implements TxJournalAppender {
   private readonly path: string;
   private readonly entries: TxJournal;
   private errors: string[] = [];
+  private writeChain: Promise<void> = Promise.resolve();
 
   constructor(txDir: string, txId: string) {
     this.path = join(txDir, journalName);
-    this.entries = { txId, status: "staging", createdAt: new Date().toISOString(), commits: [] };
-    void this.persist();
+    this.entries = {
+      txId,
+      status: "staging",
+      createdAt: new Date().toISOString(),
+      heartbeatAt: new Date().toISOString(),
+      pid: process.pid,
+      commits: [],
+      errors: [],
+    };
+    void this.persistSync();
   }
 
-  set(patch: Partial<TxJournal>): void {
+  set(patch: Partial<TxJournal>): Promise<void> {
     Object.assign(this.entries, patch);
-    void this.persist();
+    return this.persistSync();
   }
 
-  recordBackup(name: string, target: string, backup: string | undefined): void {
-    this.entries.commits.push({ name, target, backup: backup ?? "" });
-    void this.persist();
+  recordCommit(commit: TxCommit): Promise<void> {
+    const existing = this.entries.commits.find((c) => c.name === commit.name);
+    if (existing) {
+      Object.assign(existing, commit);
+    } else {
+      this.entries.commits.push({ ...commit });
+    }
+    return this.persistSync();
   }
 
   appendError(message: string): void {
     this.errors.push(message);
-    void this.persist();
+    this.entries.errors = [...this.errors];
+    void this.persistSync();
+  }
+
+  heartbeat(): Promise<void> {
+    this.entries.heartbeatAt = new Date().toISOString();
+    return this.persistSync();
   }
 
   getErrors(): string[] {
     return this.errors;
   }
 
-  private async persist(): Promise<void> {
-    try {
-      await writeFile(
-        this.path,
-        `${JSON.stringify({ ...this.entries, errors: this.errors }, null, 2)}\n`,
-        "utf8",
-      );
-    } catch {
-      // Persistence best-effort; in-memory state still drives rollback.
-    }
+  private persistSync(): Promise<void> {
+    this.writeChain = this.writeChain
+      .catch(() => undefined)
+      .then(() => this.atomicWrite());
+    return this.writeChain;
+  }
+
+  private async atomicWrite(): Promise<void> {
+    // Plain writeFile keeps the journal durable-enough for crash recovery.
+    // Renaming over an existing file is unreliable on Windows (EPERM if an
+    // AV scanner or other reader holds it open) and readJournal already
+    // tolerates a partial/corrupt JSON via JSON.parse failure.
+    const payload = `${JSON.stringify({ ...this.entries, errors: this.errors }, null, 2)}\n`;
+    await writeFile(this.path, payload, "utf8");
   }
 }
 
@@ -620,50 +684,89 @@ async function withInstallTx(
 ): Promise<void> {
   const txRoot = join(destination, txDirName);
   await mkdir(txRoot, { recursive: true });
-  const txId = newTxId();
-  const txDir = join(txRoot, txId);
-  await mkdir(txDir, { recursive: true });
-  const journal = new TxJournalWriter(txDir, txId);
-
   const release = await acquireLock(txRoot);
+  let txDir: string | undefined;
+  let journal: TxJournalWriter | undefined;
   let succeeded = false;
+  const heartbeat = startHeartbeat(() => journal?.heartbeat());
   try {
+    const txId = newTxId();
+    txDir = join(txRoot, txId);
+    await mkdir(txDir, { recursive: true });
+    journal = new TxJournalWriter(txDir, txId);
     await body(txDir, journal);
     succeeded = true;
   } catch (error) {
     try {
-      const j = await readJournal(txDir);
-      if (j && j.status !== "done" && j.commits.length > 0) {
-        await rollbackCommits(j.commits, journal);
+      if (txDir && journal) {
+        const j = await readJournal(txDir);
+        if (j && j.status !== "done" && j.commits.some((c) => c.state !== "restored" && c.state !== "prepared")) {
+          // Recovery path: re-run rollback using the persisted journal state, which is idempotent.
+          await rerunRollback(txDir, j, journal);
+        }
       }
     } catch {
       // Original error wins.
     }
-    try {
-      if (await pathExists(txDir)) {
+    if (txDir && (await pathExists(txDir))) {
+      try {
         await rename(txDir, `${txDir}.failed-${Date.now()}`);
+      } catch {
+        // Best-effort: leave failed tx dir for `rtas recover`.
       }
-    } catch {
-      // Best-effort: leave the failed tx dir in place for later recovery.
     }
     throw error;
-  } finally {
-    try {
-      if (succeeded) {
-        await rm(txDir, { recursive: true, force: true });
+  }   finally {
+    heartbeat.stop();
+    if (succeeded && txDir) {
+      try {
+        await rmWithRetry(txDir);
+      } catch {
+        // Best-effort cleanup; leftover dir is recoverable via `rtas recover`.
       }
-    } catch {
-      // Best-effort cleanup.
     }
     await release();
     if (succeeded) {
+      // txRoot is private to this lock owner; safe to remove recursively.
       try {
-        await rm(txRoot, { recursive: true, force: true });
+        await rmWithRetry(txRoot);
       } catch {
-        // Other concurrent installs may still be using the tx root.
+        // Best-effort: leave txRoot for `rtas recover` if removal keeps failing.
       }
     }
   }
+}
+
+async function rmWithRetry(target: string): Promise<void> {
+  const maxAttempts = 10;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      await rm(target, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!isExistsError(error) && !isEpermError(error)) throw error;
+      await sleep(50 * Math.pow(2, attempt));
+    }
+  }
+  throw lastError instanceof Error
+    ? lastError
+    : new Error(`rmWithRetry failed: ${target}`);
+}
+
+function isEpermError(error: unknown): boolean {
+  return typeof error === "object"
+    && error !== null
+    && (error as NodeJS.ErrnoException).code === "EPERM";
+}
+
+function startHeartbeat(beat: () => Promise<void> | undefined): { stop: () => void } {
+  const handle = setInterval(() => {
+    const result = beat();
+    if (result) void result.catch(() => undefined);
+  }, heartbeatIntervalMs);
+  return { stop: () => clearInterval(handle) };
 }
 
 async function acquireLock(txRoot: string): Promise<() => Promise<void>> {
@@ -688,40 +791,52 @@ async function acquireLock(txRoot: string): Promise<() => Promise<void>> {
       if (!isExistsError(error)) {
         throw error;
       }
-      if (await stealStaleLock(txRoot, lockPath)) {
+      if (await canStealLock(lockPath)) {
         continue;
       }
       await sleep(200);
     }
   }
   throw new Error(
-    `Could not acquire install lock after ${maxAttempts} attempts: ${lockPath}. Another rtas install may be running; remove the lock manually if it is stale.`,
+    `Could not acquire install lock after ${maxAttempts} attempts: ${lockPath}. Another rtas install may be running; run 'rtas recover' to clean up an abandoned lock.`,
   );
 }
 
-async function stealStaleLock(txRoot: string, lockPath: string): Promise<boolean> {
-  let startedAt: number | undefined;
+async function canStealLock(lockPath: string): Promise<boolean> {
+  let lockData: { pid?: number; startedAt?: string } = {};
   try {
     const text = await readFile(lockPath, "utf8");
-    const parsed = JSON.parse(text) as { startedAt?: string };
-    if (parsed.startedAt) {
-      const ts = Date.parse(parsed.startedAt);
-      if (!Number.isNaN(ts)) {
-        startedAt = ts;
-      }
-    }
+    lockData = JSON.parse(text) as { pid?: number; startedAt?: string };
   } catch {
-    // Not a valid lock file — fall through to mtime check.
+    // Corrupt or unreadable: treat as steal-able if file is old.
   }
+  const startedAt = lockData.startedAt ? Date.parse(lockData.startedAt) : NaN;
+  const threshold = Number.isNaN(startedAt) ? (await stat(lockPath).catch(() => ({ mtimeMs: 0 }))).mtimeMs : startedAt;
+  const lockPid = typeof lockData.pid === "number" ? lockData.pid : undefined;
 
-  const threshold = startedAt ?? (await stat(lockPath)).mtimeMs;
   if (Date.now() - threshold < lockStaleMs) {
+    return false;
+  }
+  if (lockPid !== undefined && isProcessAlive(lockPid)) {
+    // Owner is still running. Do not steal even if heartbeat is old (slow fs, paused).
     return false;
   }
   try {
     await rm(lockPath, { force: true });
     return true;
   } catch {
+    return false;
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return false;
+    if (code === "EPERM") return true;
     return false;
   }
 }
@@ -733,6 +848,39 @@ async function readJournal(txDir: string): Promise<TxJournal | undefined> {
     return JSON.parse(text) as TxJournal;
   } catch {
     return undefined;
+  }
+}
+
+interface TxJournalRecorder {
+  recordCommit(commit: TxCommit): Promise<void>;
+  appendError(message: string): void;
+}
+
+async function rerunRollback(txDir: string, j: TxJournal, journal: TxJournalRecorder): Promise<void> {
+  const committer = new TxCommitter(txDir, journal);
+  for (const commit of [...j.commits].reverse()) {
+    if (commit.state === "restored" || commit.state === "prepared") continue;
+    try {
+      // reach into private via duplicate logic
+      const backup = commit.backup;
+      const backupExists = backup ? await pathExists(backup) : false;
+      if (!backupExists) {
+        commit.state = "restored";
+        await journal.recordCommit(commit);
+        continue;
+      }
+      if (backup && backupExists) {
+        const targetExists = await pathExists(commit.target);
+        if (targetExists) {
+          await rm(commit.target, { recursive: true, force: true });
+        }
+        await rename(backup, commit.target);
+        commit.state = "restored";
+        await journal.recordCommit(commit);
+      }
+    } catch (error) {
+      journal.appendError(`recovery rollback failed for ${commit.name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 }
 
@@ -749,24 +897,42 @@ export async function recoverInterruptedInstalls(parentDir: string): Promise<str
       if (!entry.isDirectory() || entry.name === "stage" || entry.name === lockName) {
         continue;
       }
-      if (entry.name.endsWith(".failed-")) {
-        recovered.push(await cleanupFailedTx(join(txRoot, entry.name)));
-        continue;
-      }
       const txDir = join(txRoot, entry.name);
       const journal = await readJournal(txDir);
+      const backupsDir = join(txDir, "backups");
+      const backupsPresent = (await pathExists(backupsDir)) && (await readdir(backupsDir).catch(() => [])).length > 0;
+
       if (!journal) {
-        await rm(txDir, { recursive: true, force: true });
-        recovered.push(`removed orphan tx ${entry.name}`);
+        if (backupsPresent) {
+          recovered.push(
+            `preserved tx ${entry.name}: journal missing but backups exist. Inspect ${txDir} manually and move backups/<name>-* to the intended target if needed.`,
+          );
+        } else {
+          await rm(txDir, { recursive: true, force: true });
+          recovered.push(`removed orphan tx ${entry.name} (no journal, no backups)`);
+        }
         continue;
       }
+
+      if (entry.name.includes(".failed-")) {
+        recovered.push(await cleanupFailedTx(txDir, journal));
+        continue;
+      }
+
       if (journal.status === "done") {
         await rm(txDir, { recursive: true, force: true });
         recovered.push(`removed completed tx ${entry.name}`);
         continue;
       }
-      if (journal.commits.length > 0) {
-        await rollbackCommits(journal.commits, new SilentJournal());
+
+      const live = journal.pid !== undefined && isProcessAlive(journal.pid);
+      if (live && journal.commits.length === 0) {
+        recovered.push(`skipped tx ${entry.name}: owner pid ${journal.pid} still alive and staging`);
+        continue;
+      }
+      if (journal.commits.some((c) => c.state !== "restored" && c.state !== "prepared")) {
+        const writer = new SilentJournalWriter();
+        await rerunRollback(txDir, journal, writer);
         recovered.push(`rolled back tx ${entry.name} with ${journal.commits.length} commits`);
       } else {
         recovered.push(`cleaned staging-only tx ${entry.name}`);
@@ -774,9 +940,9 @@ export async function recoverInterruptedInstalls(parentDir: string): Promise<str
       await rm(txDir, { recursive: true, force: true });
     }
     try {
-      await rm(txRoot, { recursive: true, force: true });
+      await rmWithRetry(txRoot);
     } catch {
-      // Best-effort: leave txRoot if non-empty (e.g., new concurrent installs).
+      // Best-effort: leave txRoot if non-empty (e.g., concurrent installs).
     }
     return recovered;
   } finally {
@@ -784,17 +950,31 @@ export async function recoverInterruptedInstalls(parentDir: string): Promise<str
   }
 }
 
-async function cleanupFailedTx(txDir: string): Promise<string> {
-  const journal = await readJournal(txDir);
-  if (journal && journal.commits.length > 0) {
-    await rollbackCommits(journal.commits, new SilentJournal());
+async function cleanupFailedTx(txDir: string, journal: TxJournal | undefined): Promise<string> {
+  if (journal && journal.commits.some((c) => c.state !== "restored" && c.state !== "prepared")) {
+    const writer = new SilentJournalWriter();
+    await rerunRollback(txDir, journal, writer);
   }
   await rm(txDir, { recursive: true, force: true });
   return `rolled back failed tx ${basename(txDir)}`;
 }
 
-class SilentJournal implements TxJournalAppender {
+class SilentJournalWriter implements TxJournalRecorder {
   appendError(): void { /* no-op */ }
+  recordCommit(): Promise<void> { return Promise.resolve(); }
+}
+
+async function rmEmptyDir(path: string): Promise<void> {
+  try {
+    const stats = await stat(path);
+    if (!stats.isDirectory()) return;
+    const entries = await readdir(path);
+    if (entries.length === 0) {
+      await rm(path, { recursive: false, force: true });
+    }
+  } catch {
+    // best-effort
+  }
 }
 
 async function copyRouterTree(routerSource: string, stagedDir: string, installedRouterText: string): Promise<void> {
