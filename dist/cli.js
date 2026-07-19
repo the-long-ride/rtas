@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { findRustRules, getRustTauriWorkspaceMode, installRouterSkill, installSkills, listRustRules, readRustRule, listSkills, resolveAgentDestination, resolveDefaultDestination, setRustTauriWorkspaceMode, validateSkills, } from "./index.js";
+import { resolve } from "node:path";
+import { findRustRules, getRustTauriWorkspaceMode, installRouterSkill, installSkills, listRustRules, readRustRule, listSkills, resolveAgentDestination, resolveDefaultDestination, setRustTauriWorkspaceMode, suggestAgent, validateSkills, } from "./index.js";
 const [, , rawCommand, ...rawArgs] = process.argv;
 const aliasCommand = rawCommand === "on" || rawCommand === "off" || rawCommand === "status";
 const command = aliasCommand ? "rust-tauri" : rawCommand;
@@ -8,10 +9,9 @@ try {
     switch (command) {
         case "install": {
             const global = args.includes("--global") || args.includes("-g");
-            const destArg = args.find((arg) => !arg.startsWith("-"));
-            const destination = resolveInstallDestination(destArg, global);
             const force = args.includes("--force");
             const all = args.includes("--all");
+            const destination = resolveInstallDestination(args, global);
             const result = all
                 ? await installSkills(destination, { force })
                 : await installRouterSkill(destination, { force });
@@ -96,7 +96,7 @@ catch (error) {
 function usage(exitCode) {
     console.log(`Usage:
   rtas install [AGENT] [--global] [--force] [--all]
-  rtas install DESTINATION_PATH [--force] [--all]
+  rtas install --dest DESTINATION_PATH [--global] [--force] [--all]
   rtas list
   rtas validate
   rtas rules [QUERY]
@@ -106,6 +106,7 @@ function usage(exitCode) {
 
 Default install: ./.agents/skills/rust-tauri-agent-skills  (or ~/.agents/skills/rust-tauri-agent-skills with --global)
 Agents: claude, codex, copilot, gemini, github, opencode
+Use --dest <path> to install to a custom filesystem path instead of an agent name.
 Also works as: rust-tauri-agent-skills, rust-tauri, rtas-skills`);
     process.exit(exitCode);
 }
@@ -120,14 +121,31 @@ function getOptionValue(args, option) {
     }
     return value;
 }
-function resolveInstallDestination(destArg, global) {
-    if (!destArg) {
+function resolveInstallDestination(args, global) {
+    const explicitIndex = args.indexOf("--dest");
+    if (explicitIndex !== -1) {
+        const value = args[explicitIndex + 1];
+        if (!value || value.startsWith("-")) {
+            throw new Error("Missing value for --dest");
+        }
+        return resolve(value);
+    }
+    const positional = args.filter((arg) => !arg.startsWith("-"));
+    if (positional.length === 0) {
+        return resolveDefaultDestination(global);
+    }
+    const candidate = positional[0];
+    if (!candidate) {
         return resolveDefaultDestination(global);
     }
     try {
-        return resolveAgentDestination(destArg, global);
+        return resolveAgentDestination(candidate, global);
     }
-    catch {
-        return destArg;
+    catch (error) {
+        const suggestion = suggestAgent(candidate);
+        const hint = suggestion
+            ? ` Did you mean "${suggestion}"?`
+            : " Use --dest <path> to install to a custom filesystem path.";
+        throw new Error(`${error instanceof Error ? error.message : String(error)}.${hint}`);
     }
 }

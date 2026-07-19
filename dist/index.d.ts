@@ -32,6 +32,7 @@ export declare const AGENT_DIRS: Record<string, {
 export declare function resolveAgentDestination(agentOrPath: string, global?: boolean, workspace?: string): string;
 export declare function getSupportedAgents(): string[];
 export declare function resolveDefaultDestination(global?: boolean, workspace?: string): string;
+export declare function suggestAgent(input: string): string | undefined;
 export declare function getPackageRoot(): string;
 export declare function getSkillsDir(): string;
 export declare function getRustRulesDir(): string;
