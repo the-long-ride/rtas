@@ -49,8 +49,9 @@ npx @the-long-ride/rust-tauri-agent-skills validate
 The installer accepts an agent name (`claude`, `codex`, `copilot`, `gemini`, `github`,
 `opencode`) and writes the single router skill to the conventional workspace-local directory for
 that agent. If no agent is given it uses the default path shown above. Add `--global` to install to
-the conventional global directory instead. You can still pass an explicit path as the destination
-for agents that are not yet mapped.
+the conventional global directory instead. For unmapped agents or any other filesystem location, pass
+`--dest <path>`; an unknown agent name is rejected with a "did you mean" hint instead of being
+silently treated as a path.
 Use `--all` only when you intentionally want every specialist skill exposed directly in the agent
 skill directory.
 Use project-local installs when the skill pack belongs to one repository; use global installs
@@ -239,10 +240,11 @@ npm run build
 npm pack --dry-run
 ```
 
-Legacy direct-copy scripts are still available. They copy every folder under `skills/`; use them only
-when you intentionally want every specialist exposed directly.
-
-Copy the folders under `skills/` into the skills directory supported by your agent.
+Legacy direct-copy scripts are still available, but they are now thin bootstrap wrappers
+around `node dist/cli.js install --dest <path> --all`. Run them only when you intentionally want
+every specialist exposed directly. They require `dist/cli.js` to be present — run
+`npm install && npm run build` first inside a raw checkout, or use the npm package which ships
+`dist/` already built.
 
 PowerShell:
 
@@ -256,7 +258,10 @@ Shell:
 ./install.sh "$HOME/.claude/skills"
 ```
 
-You can choose a project-local destination instead. The scripts only copy directories and never delete existing skills unless `-Force`/`--force` is supplied.
+Both scripts accept `--force` (or `-Force` in PowerShell) to replace an existing installation
+atomically: the new tree is staged into a temporary directory, the existing tree is moved to a
+backup, and the staged tree is renamed into place. If staging fails, the backup is restored and
+the destination is left untouched.
 
 ## Start
 
